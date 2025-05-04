@@ -1,0 +1,452 @@
+---
+title: "CR on PSQI"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-12-02"
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(gee)
+library(geepack)
+library(tidyr)
+library(ggplot2)
+library(table1)
+
+psqi_data <- read.csv("/Users/jasmine/Downloads/PSQI.CSV")
+subject <- read.csv("/Users/jasmine/Downloads/SUBJECT1.CSV")
+infor <- read.csv("/Users/jasmine/Downloads/IVRSRAND.CSV")
+weight <- read.csv("/Users/jasmine/Downloads/CLWTVIS.CSV")
+
+n_subjects <- length(unique(psqi_data$DEIDNUM))
+print(paste("Number of unique subjects:", n_subjects))
+
+visit_dist <- table(psqi_data$VISIT)
+print("Visit distribution:")
+
+print(visit_dist)
+
+summary(psqi_data$PSQISCOR)
+
+missing_data <- colSums(is.na(psqi_data))
+print("Missing values per variable:")
+print(missing_data)
+
+psqi_data <- psqi_data %>%
+  mutate(
+    visit_num = case_when(
+      visit == "BL Sub 1" ~ 4,    # Baseline
+      visit == "Month 12" ~ 11,   # 12 months
+      visit == "Month 24" ~ 13,   # 24 months
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(visit_num %in% c(4, 11, 13))
+
+psqi_clean <- psqi_data %>%
+  mutate(
+    time = case_when(
+      visit_num == 4 ~ 0,
+      visit_num == 11 ~ 12,
+      visit_num == 13 ~ 24
+    ),
+    subject_id = as.factor(deidnum)
+  ) %>%
+  filter(!is.na(psqiscor))
+
+merged_data <- psqi_clean %>%
+  select(deidnum, visit, time, psqiscor, subject_id) %>%
+  left_join(subject %>% select(deidnum, GENDER, rand, bl1dt, randomdt, inventdt, age, bmistrat), by = "deidnum") %>%
+  left_join(infor %>% select(deidnum, tx), by = "deidnum") %>%
+  left_join(weight %>% select(deidnum, visit, deltawtb, pdeltawt), by = c("deidnum", "visit")) %>%
+  filter(rand == "Yes" & inventdt == 0) %>%
+  mutate(
+    tx_binary = ifelse(tx == "Caloric Restriction", 1, 0),
+    tx_binary = factor(tx_binary),
+    GENDER = factor(GENDER, levels = c("Female", "Male"))
+  )
+# Define 'Time' and 'Treatment' variables
+merged_data <- merged_data %>%
+  mutate(
+    Time = factor(
+      time,
+      levels = c(0, 12, 24),
+      labels = c("Baseline (0 months)", "Month 12", "Month 24")
+    ),
+    Treatment = factor(
+      tx_binary,
+      levels = c(0, 1),
+      labels = c("Control", "Caloric Restriction")
+    )
+  )
+
+# Explicitly use dplyr::select to avoid conflicts
+baseline_psqi <- psqi_data %>%
+  filter(visit == "BL Sub 1") %>%
+  dplyr::select(deidnum, psqiscor)
+
+# Rename the psqiscor column to baseline_psqi for clarity
+baseline_psqi <- baseline_psqi %>%
+  rename(baseline_psqi = psqiscor)
+
+# Merge baseline_psqi into merged_data using deidnum
+merged_data <- merged_data %>%
+  left_join(baseline_psqi, by = "deidnum")
+
+# Create summary statistics for plotting
+summary_stats <- merged_data %>%
+  group_by(time, tx_binary) %>%
+  summarise(
+    n = n(),
+    mean_psqi = mean(psqiscor, na.rm = TRUE),
+    sd_psqi = sd(psqiscor, na.rm = TRUE)
+  )
+
+```
+
+
+```{r}
+label(merged_data$age) <- "Age (years)"
+label(merged_data$deltawtb) <- "Change in Weight (kg)"
+label(merged_data$GENDER) <- "Gender"
+label(merged_data$bmistrat) <- "BMI"
+label(merged_data$psqiscor) <- "Global PSQI score"
+
+
+
+# Generate the descriptive statistics table
+table1(~ GENDER + bmistrat + age + psqiscor + deltawtb|
+         time * tx,
+       data = merged_data,
+       caption = "Descriptive Statistics Stratified by Time and Treatment")
+```
+
+
+
+```{r gee-models}
+gee_exchangeable <- geeglm(
+  psqiscor ~ time * tx_binary, 
+  data = merged_data,
+  id = subject_id,
+  family = gaussian,
+  corstr = "exchangeable"
+)
+
+gee_independence <- geeglm(
+  psqiscor ~ time * tx_binary, 
+  data = merged_data,
+  id = subject_id,
+  family = gaussian,
+  corstr = "independence"
+)
+
+gee_ar1 <- geeglm(
+  psqiscor ~ time * tx_binary, 
+  data = merged_data,
+  id = subject_id,
+  family = gaussian,
+  corstr = "ar1"
+)
+
+print("Exchangeable correlation structure:")
+summary(gee_exchangeable)
+
+print("Independence correlation structure:")
+summary(gee_independence)
+
+print("AR1 correlation structure:")
+summary(gee_ar1)
+```
+
+
+```{r gee-gender}
+gee_gender <- geeglm(
+  psqiscor ~ tx_binary * GENDER * time + age,
+  data = merged_data,
+  id = subject_id,
+  family = gaussian,
+  corstr = "exchangeable"
+)
+
+print("Gender interaction model:")
+summary(gee_gender)
+```
+
+```{r ploy-treatment}
+ggplot(summary_stats, aes(x = time, y = mean_psqi, color = tx_binary, group = tx_binary)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_psqi - sd_psqi/sqrt(n), ymax = mean_psqi + sd_psqi/sqrt(n)), width = 0.5) +
+  scale_x_continuous(breaks = c(0, 12, 24)) +
+  labs(
+    title = "Effect of Caloric Restriction on Sleep Quality",
+    x = "Time (Months)",
+    y = "Mean PSQI Score",
+    color = "Treatment Group"
+  ) +
+  theme_minimal()
+```
+
+```{r plot-gender}
+gender_stats <- merged_data %>%
+  group_by(time, tx_binary, GENDER) %>%
+  summarise(
+    n = n(),
+    mean_psqi = mean(psqiscor, na.rm = TRUE),
+    sd_psqi = sd(psqiscor, na.rm = TRUE)
+  )
+
+ggplot(gender_stats, aes(x = time, y = mean_psqi, color = tx_binary, linetype = GENDER, group = interaction(tx_binary, GENDER))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_psqi - sd_psqi/sqrt(n), ymax = mean_psqi + sd_psqi/sqrt(n)), width = 0.5) +
+  scale_x_continuous(breaks = c(0, 12, 24)) +
+  labs(
+    title = "Effect of Caloric Restriction on Sleep Quality by Gender",
+    x = "Time (Months)",
+    y = "Mean PSQI Score",
+    color = "Treatment Group",
+    linetype = "Gender"
+  ) +
+  theme_minimal()
+```
+
+
+```{r qic-comparison}
+QIC_comparison <- data.frame(
+  Model = c("Exchangeable", "Independence", "AR1", "Gender interaction"),
+  QIC = c(QIC(gee_exchangeable), QIC(gee_independence), QIC(gee_ar1), QIC(gee_gender))
+)
+
+print("QIC comparison:")
+print(QIC_comparison)
+```
+
+#### Question 1: What is the effect of caloric restriction on sleep quality over the two-year intervention period? (GEE)
+```{r}
+model1 <- geeglm(
+  formula = psqiscor ~ tx_binary * time,
+  data = merged_data,
+  id = subject_id,            # Subject identifier for repeated measures
+  family = gaussian(link = "identity"),        # Use gaussian for continuous outcomes
+  corstr = "exchangeable"     # Correlation structure (can also use "ar1" or "unstructured")
+)
+
+# Summary of the model
+summary(model1)
+
+QIC(model1)
+
+# Extract coefficients from the model summary
+summary_model <- summary(model1)
+coef_table <- as.data.frame(summary_model$coefficients)
+coef_table <- coef_table[, c("Estimate", "Std.err", "Wald", "Pr(>|W|)")]
+
+# Add row names (terms) as a column
+coef_table$Term <- c("Intercept", "Treatment = AL", "Time", "Treatment = AL:Time")
+
+# Rearrange columns
+coef_table <- coef_table[, c("Term", "Estimate", "Std.err", "Wald", "Pr(>|W|)")]
+
+# Print the table using knitr::kable
+knitr::kable(
+  coef_table,
+  col.names = c("Term", "Estimate", "Std. Error", "Wald Statistic", "p-value"),
+  caption = "Summary of GEE Model Results"
+)
+```
+
+#### Question 2: How does gender modify the effect of caloric restriction on sleep quality over time?
+```{r}
+model_combined <- geeglm(
+  formula = psqiscor ~ tx_binary * time * GENDER,
+  data = merged_data,
+  id = subject_id,
+  family = gaussian(link = "identity"),
+  corstr = "exchangeable"
+)
+summary(model_combined)
+
+summary_model <- summary(model_combined)
+coef_table_1 <- as.data.frame(summary_model$coefficients)
+
+# Create a mapping of raw term names to readable labels
+readable_labels <- c(
+  "(Intercept)" = "Baseline Sleep Quality (AL, BMI (22-25))",
+  "tx_binary1" = "Effect of CR (Baseline, Female)",
+  "time" = "Effect of Time (AL Group)",
+  "GENDERMale" = "Effect of Male Gender (AL Group)",
+  "tx_binary1:time" = "Interaction: CR × Time",
+  "tx_binary1:GENDERMale" = "Interaction: CR × Male Gender",
+  "time:GENDERMale" = "Interaction: Time × Male Gender",
+  "tx_binary1:time:GENDERMale" = "Interaction: CR × Time × Male Gender"
+)
+
+# Replace term names with readable labels
+coef_table_1$Term <- readable_labels[rownames(coef_table_1)]
+
+# Rearrange the columns for presentation
+coef_table_1 <- coef_table_1[, c("Term", "Estimate", "Std.err", "Wald", "Pr(>|W|)")]
+
+# Create a table using knitr::kable
+knitr::kable(
+  coef_table_1,
+  col.names = c("Term", "Estimate", "Standard Error", "Wald Statistic", "P-Value"),
+  caption = "Summary of GEE Model Coefficients"
+)
+
+```
+
+#### Question 3: To what extent does weight change mediate the effect of caloric restriction on sleep quality?
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(mediation)
+library(ggplot2)
+
+# Prepare data for mediation analysis
+mediation_data <- merged_data %>%
+  filter(!is.na(deltawtb) & !is.na(psqiscor)) %>% # Remove rows with NA values
+  mutate(
+    treatment = ifelse(tx_binary == 1, 1, 0),  # Convert treatment variable to binary
+    time_factor = factor(time, levels = c(0, 12, 24)) # Convert time to a factor
+  )
+
+# Traditional Mediation Analysis Steps
+
+# Step 1: Total Effect (Path c) - CR on Sleep Quality
+total_effect_model <- lm(psqiscor ~ treatment + time_factor + GENDER + age + bmistrat, 
+                         data = mediation_data)
+summary(total_effect_model)
+
+# Step 2: Path A - CR on Weight Change
+path_a_model <- lm(deltawtb ~ treatment + time_factor + GENDER + age + bmistrat, 
+                   data = mediation_data)
+summary(path_a_model)
+
+# Step 3: Path B - Weight Change on Sleep Quality (controlling for CR)
+path_b_model <- lm(psqiscor ~ deltawtb + treatment + time_factor + GENDER + age + bmistrat, 
+                   data = mediation_data)
+summary(path_b_model)
+
+# Step 4: Mediation Analysis
+# Traditional Baron and Kenny approach
+# Check if conditions for mediation are met:
+# 1. Total effect (Path c) significant
+# 2. Treatment affects mediator (Path a) significant
+# 3. Mediator affects outcome (Path b) significant
+# 4. Direct effect reduced when mediator is included
+
+# Manual Sobel Test
+a_coef <- coef(path_a_model)["treatment"]
+b_coef <- coef(path_b_model)["deltawtb"]
+se_a <- summary(path_a_model)$coefficients["treatment", "Std. Error"]
+se_b <- summary(path_b_model)$coefficients["deltawtb", "Std. Error"]
+
+# Sobel Test Statistic
+sobel_se <- sqrt(b_coef^2 * se_a^2 + a_coef^2 * se_b^2)
+sobel_z <- (a_coef * b_coef) / sobel_se
+sobel_p <- 2 * (1 - pnorm(abs(sobel_z)))
+
+cat("Sobel Test Results:\n")
+cat("Z-statistic:", sobel_z, "\n")
+cat("p-value:", sobel_p, "\n")
+
+# Gender-Specific Mediation Analysis
+perform_mediation_by_gender <- function(gender) {
+  gender_data <- mediation_data %>% filter(GENDER == gender)
+  
+  # Path A: CR on Weight Change
+  path_a_model_gender <- lm(deltawtb ~ treatment + time_factor + age + bmistrat, 
+                            data = gender_data)
+  
+  # Path B: Weight Change on Sleep Quality
+  path_b_model_gender <- lm(psqiscor ~ deltawtb + treatment + time_factor + age + bmistrat, 
+                            data = gender_data)
+  
+  # Sobel Test for gender-specific mediation
+  a_coef <- coef(path_a_model_gender)["treatment"]
+  b_coef <- coef(path_b_model_gender)["deltawtb"]
+  se_a <- summary(path_a_model_gender)$coefficients["treatment", "Std. Error"]
+  se_b <- summary(path_b_model_gender)$coefficients["deltawtb", "Std. Error"]
+  
+  sobel_se <- sqrt(b_coef^2 * se_a^2 + a_coef^2 * se_b^2)
+  sobel_z <- (a_coef * b_coef) / sobel_se
+  sobel_p <- 2 * (1 - pnorm(abs(sobel_z)))
+  
+  list(
+    path_a_model = path_a_model_gender,
+    path_b_model = path_b_model_gender,
+    sobel_z = sobel_z,
+    sobel_p = sobel_p
+  )
+}
+
+# Perform gender-specific mediation analysis
+female_mediation <- perform_mediation_by_gender("Female")
+male_mediation <- perform_mediation_by_gender("Male")
+
+# Print gender-specific results
+cat("\nFemale Mediation Analysis:\n")
+cat("Sobel Z-statistic:", female_mediation$sobel_z, "\n")
+cat("Sobel p-value:", female_mediation$sobel_p, "\n")
+
+cat("\nMale Mediation Analysis:\n")
+cat("Sobel Z-statistic:", male_mediation$sobel_z, "\n")
+cat("Sobel p-value:", male_mediation$sobel_p, "\n")
+
+######## Overall Mediation Analysis Plot ########
+# Create a dataframe for plotting
+mediation_results <- data.frame(
+  Effect = c("ACME", "ADE", "Total Effect"),
+  Estimate = c(-0.4, 0.3, -0.1),  # Replace with your point estimates
+  LowerCI = c(-0.78, -0.27, -0.52),  # Replace with lower bounds of CI
+  UpperCI = c(-0.06, 0.90, 0.37)  # Replace with upper bounds of CI
+)
+
+# Plot the mediation analysis results
+ggplot(mediation_results, aes(x = Estimate, y = Effect)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = LowerCI, xmax = UpperCI), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = "Mediation Analysis - Overall", x = "Effect Size", y = "") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 12))
+
+######## Gender-Specific Mediation Analysis Plots ########
+# Create dataframes for Female and Male mediation results
+female_results <- data.frame(
+  Effect = c("ACME", "ADE", "Total Effect"),
+  Estimate = c(-0.5, 0.1, -0.4),  # Replace with Female estimates
+  LowerCI = c(-0.93, -0.61, -0.88),  # Replace with Female lower bounds
+  UpperCI = c(-0.02, 0.93, 0.24)  # Replace with Female upper bounds
+)
+
+male_results <- data.frame(
+  Effect = c("ACME", "ADE", "Total Effect"),
+  Estimate = c(-0.1, 0.3, 0.1),  # Replace with Male estimates
+  LowerCI = c(-0.76, -0.26, -0.17),  # Replace with Male lower bounds
+  UpperCI = c(0.44, 1.55, 1.21)  # Replace with Male upper bounds
+)
+
+# Plot for Female
+ggplot(female_results, aes(x = Estimate, y = Effect)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = LowerCI, xmax = UpperCI), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = "Mediation Analysis - Female", x = "Effect Size", y = "") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 12))
+
+# Plot for Male
+ggplot(male_results, aes(x = Estimate, y = Effect)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = LowerCI, xmax = UpperCI), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = "Mediation Analysis - Male", x = "Effect Size", y = "") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 12))
+```
